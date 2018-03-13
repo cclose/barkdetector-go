@@ -64,6 +64,12 @@ func processInput(inputQueue chan SamplePacket, done chan bool, waveWriter *wave
 }
 
 func main() {
+    defer func() {
+        //catch exceptions
+        if r := recover(); r != nil {
+          //handle shutdown here
+        }
+    }()
 
 	var audioFileName string
 	var bufferSize, sampleRate int
