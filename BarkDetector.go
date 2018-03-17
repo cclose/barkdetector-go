@@ -1,13 +1,13 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"github.com/gordonklaus/portaudio"
+	"github.com/zenwerk/go-wave"
 	"log"
 	"os"
 	"time"
-	"github.com/zenwerk/go-wave"
-	"flag"
 )
 
 var active bool = true
@@ -16,13 +16,14 @@ var verbose bool = false
 
 type SamplePacket struct {
 	buffer []byte
-	start time.Time
-	stop time.Time
+	start  time.Time
+	stop   time.Time
 }
 
 func processInput(inputQueue chan SamplePacket, done chan bool, waveWriter *wave.Writer) {
 	var sample SamplePacket
 	printedSlice := 2
+	count := 0
 	for {
 		select {
 		case sample = <-inputQueue:
@@ -32,12 +33,13 @@ func processInput(inputQueue chan SamplePacket, done chan bool, waveWriter *wave
 			//TODO DELETE
 			if printedSlice > 0 {
 				//for i, val := range sample.buffer {
-                //	fmt.Printf("%d-%x|", i, val)
+				//	fmt.Printf("%d-%x|", i, val)
 				//}
 				//fmt.Println()
 				printedSlice--
 			}
 			//TODO DELETE END
+			count++
 
 			if writeWave {
 				_, err := waveWriter.Write([]byte(sample.buffer)) // WriteSample16 for 16 bits
@@ -50,6 +52,7 @@ func processInput(inputQueue chan SamplePacket, done chan bool, waveWriter *wave
 			//if we're not active, signal the mothership and return
 			if !active {
 				fmt.Println("-Processor read kill signal")
+				fmt.Printf("Processed %d packets\n", count)
 				if writeWave {
 					waveWriter.Close()
 				}
@@ -64,28 +67,48 @@ func processInput(inputQueue chan SamplePacket, done chan bool, waveWriter *wave
 }
 
 func main() {
-    defer func() {
-        //catch exceptions
-        if r := recover(); r != nil {
-          //handle shutdown here
-        }
-    }()
+	defer func() {
+		//catch exceptions
+		if r := recover(); r != nil {
+			//handle shutdown here
+		}
+	}()
 
-	var audioFileName string
+	var audioFileName, preset string
 	var bufferSize, sampleRate int
 	if true {
 		writeWaveTmp := flag.Bool("WriteWave", false, "Write a .wav file of the processed input")
 		waveFileTmp := flag.String("WaveFile", "barkOut.wav", "The file to write to")
-		bufferSizeTmp := flag.Int("BufferSize", 4096, "Size of framebuffer in bytes")
+		presetTmp := flag.String("Preset", "hifi", "preset recording values (hifi,midfi,lowfi)")
+		bufferSizeTmp := flag.Int("BufferSize", 196608, "Size of framebuffer in bytes")
 		sampleRateTmp := flag.Int("SampleRate", 44100, "Sample Rate")
 		verboseTmp := flag.Bool("Verbose", false, "Verbose output mode")
 		flag.Parse()
 
 		writeWave = *writeWaveTmp
 		audioFileName = *waveFileTmp
+		preset = *presetTmp
 		bufferSize = *bufferSizeTmp
 		sampleRate = *sampleRateTmp
 		verbose = *verboseTmp
+		if preset != "" {
+			switch preset {
+			case "hifi":
+				sampleRate = 44100
+				bufferSize = 196608
+				break
+			case "midfi":
+				sampleRate = 22050
+				bufferSize = 98304
+				break
+			case "lofi":
+				sampleRate = 11025
+				bufferSize = 49152
+				break
+			default:
+				log.Fatal("invalid preset " + preset)
+			}
+		}
 	}
 
 	//defaults
@@ -158,7 +181,7 @@ func main() {
 			hasFailed--
 		}
 
-		if time.Since(start) > time.Second * 10 {
+		if time.Since(start) > time.Second*10 {
 			break
 		}
 
