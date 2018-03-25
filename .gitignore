@@ -15,9 +15,11 @@
 
 # Output of go build
 BarkDetector
+barkdetector-go
 
 # Output of command
 *.wav
+*.csv
 
 # Vim and IDE
 *.sw*
