@@ -26,7 +26,7 @@ type SamplePacket struct {
 }
 
 type TimeValue struct {
-	stamp time.Time
+	stamp  time.Time
 	values []int
 }
 
@@ -46,7 +46,7 @@ func (sp *SignalProcessor) handleInput(out [][]byte) {
 }
 
 func NewTimeValue(stamp time.Time, numValues int64) *TimeValue {
-	newTV := TimeValue{ stamp: stamp }
+	newTV := TimeValue{stamp: stamp}
 	newTV.values = make([]int, numValues)
 	return &newTV
 }
@@ -58,6 +58,10 @@ func processInputRT(inputQueue chan SamplePacket, done chan bool, waveWriter *wa
 	currChunk := time.Now().Truncate(valueLen).Add(valueLen)
 	chkId := currChunk.UnixNano()
 	sum := 0
+	samples := 0
+	if writeCSV {
+		csvWriter.WriteString("\n\n\nTimeStamp(NS),dB,RMS,Average,NumberOfSamples\n")
+	}
 	for {
 		select {
 		case sample = <-inputQueue:
@@ -66,18 +70,26 @@ func processInputRT(inputQueue chan SamplePacket, done chan bool, waveWriter *wa
 			currTime := sample.start
 			//currSampleChunk := sample.start.Truncate(valueLen).Add(valueLen)
 			for _, val := range sample.buffer {
+				intVal := int(val) / 127
 				currTime = currTime.Add(chunkDur)
 				if currTime.After(currChunk) {
 					currChunk = currTime.Truncate(valueLen).Add(valueLen)
 					chkId = currChunk.UnixNano()
-					avg := 20 * math.Log10((math.Sqrt(float64(sum / len(sample.buffer))) / 127 ))
-					fmt.Printf("\r SPL: %f", avg)
-					if writeCSV {
-						csvWriter.WriteString(fmt.Sprintf("%d,%f\n", chkId, avg))
+					if samples > 0 {
+						avg := float64(sum / samples)
+						rms := math.Sqrt(avg)
+						db := 20 * math.Log10(rms)
+						//db := 20 * math.Log10(math.Sqrt(float64(sum/samples)))
+						fmt.Printf("\r SPL: %f", db)
+						if writeCSV {
+							csvWriter.WriteString(fmt.Sprintf("%d,%f,%f,%f,%d,%d\n", chkId, db, rms, avg, sum, samples))
+						}
 					}
 					sum = 0
+					samples = 0
 				}
-				sum += int(val) * int(val)
+				sum += intVal * intVal
+				samples++
 			}
 
 			if writeWave {
@@ -120,7 +132,7 @@ func processInput(inputQueue chan SamplePacket, done chan bool, waveWriter *wave
 			sampleDur := sample.stop.Sub(sample.start)
 			chunkDur := time.Duration(int64(sampleDur) / int64(len(sample.buffer)))
 			smpsPerChunk := int64(int64(len(sample.buffer)) / int64(sampleDur))
-			smpsPerChunk++; //round up
+			smpsPerChunk++ //round up
 
 			currTime := sample.start
 			currChunk := sample.start.Truncate(valueLen).Add(valueLen)
@@ -176,7 +188,7 @@ func writeValues(csvWriter *bufio.Writer) {
 		for i := 0; i < numValues; i++ {
 			sum += tv.values[i] * tv.values[i]
 		}
-		avg := 20 * math.Log10(math.Sqrt(float64(sum / len(values))) / 127 )
+		avg := 20 * math.Log10(math.Sqrt(float64(sum/len(values)))/127)
 		csvWriter.WriteString(fmt.Sprintf("%d,%f\n", key, avg))
 	}
 
@@ -246,7 +258,6 @@ func main() {
 	portaudio.Initialize()
 	defer portaudio.Terminate()
 
-
 	processQ := make(chan SamplePacket, 1028)
 
 	var waveWriter *wave.Writer
@@ -275,8 +286,7 @@ func main() {
 		}
 		defer csvFile.Close()
 		csvWriter = bufio.NewWriter(csvFile)
-        }
-
+	}
 
 	done := make(chan bool, 1)
 
