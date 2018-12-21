@@ -1,6 +1,8 @@
 package main
 
 import (
+        "bytes"
+	"encoding/binary"
 	"bufio"
 	"flag"
 	"fmt"
@@ -9,18 +11,21 @@ import (
 	"log"
 	"math"
 	"os"
+	"os/signal"
 	"time"
 )
+
 
 var active bool = true
 var writeWave, writeCSV bool
 var verbose bool = false
-var realTime bool = false
 var values map[int64]*TimeValue
-var valueLen time.Duration
+var measurementDuration time.Duration
+
+const SIGNED_16BIT_INT = 32767
 
 type SamplePacket struct {
-	buffer []byte
+	buffer []float32
 	start  time.Time
 	stop   time.Time
 }
@@ -35,13 +40,11 @@ type SignalProcessor struct {
 	processQ chan SamplePacket
 }
 
-func (sp *SignalProcessor) handleInput(out [][]byte) {
+func (sp *SignalProcessor) handleInput(in []float32) {
 	currTime := time.Now()
 
-	sp.processQ <- SamplePacket{out[0], sp.lastTime, currTime}
-	if verbose {
-		fmt.Printf("Measured %s of audio\n", currTime.Sub(sp.lastTime))
-	}
+	sp.processQ <- SamplePacket{in, sp.lastTime, currTime}
+	//vlog(fmt.Sprintf("Measured %s of audio\n", currTime.Sub(sp.lastTime)))
 	sp.lastTime = currTime
 }
 
@@ -55,144 +58,112 @@ func processInputRT(inputQueue chan SamplePacket, done chan bool, waveWriter *wa
 	var sample SamplePacket
 	values = make(map[int64]*TimeValue)
 	count := 0
-	currChunk := time.Now().Truncate(valueLen).Add(valueLen)
+	currChunk := time.Now().Truncate(measurementDuration).Add(measurementDuration)
 	chkId := currChunk.UnixNano()
-	sum := 0
-	samples := 0
+	var sum float32 = 0
+	var samples float32 = 0
+	waveBuffer := new(bytes.Buffer)
 	if writeCSV {
 		csvWriter.WriteString("\n\n\nTimeStamp(NS),dB,RMS,Average,NumberOfSamples\n")
 	}
 	for {
 		select {
 		case sample = <-inputQueue:
+			//calculate the duration of the sample packet: stop - start
 			sampleDur := sample.stop.Sub(sample.start)
+			// calculate the duration of each sample by dividing duration by samples
+			// this is how long each sample takes
 			chunkDur := time.Duration(int64(sampleDur) / int64(len(sample.buffer)))
+			//first sample is at the start
 			currTime := sample.start
-			//currSampleChunk := sample.start.Truncate(valueLen).Add(valueLen)
+			// our first measurement point is at the start time plus the duration of our measurements
+			// trucate is used to keep our samples nice and even and avoid weird edge case logic
+			currChunk := currTime.Truncate(measurementDuration).Add(measurementDuration)
 			for _, val := range sample.buffer {
-				intVal := int(val) / 127
+                                // The values are -1 to 1, so we Multiply by 100 to make a nicer range
+				// There is no science here. SPL can't really be calculated w/o calibration
+				// Using the max value of a signed 16bit int gets close, but 100 makes the range more sensitive
+				// and this makes bark detection easier
+                                val *= 100
+				// advance the current time by the sample's duration
 				currTime = currTime.Add(chunkDur)
+				// if we're past our measurement goal
 				if currTime.After(currChunk) {
-					currChunk = currTime.Truncate(valueLen).Add(valueLen)
+					// calculate the next goal
+					currChunk = currTime.Truncate(measurementDuration).Add(measurementDuration)
+					// get the timestamp of this chunk
 					chkId = currChunk.UnixNano()
+					// calculate the measurement for this chunk
 					if samples > 0 {
+						//our faux dB calculation. We find the average value for the duration
 						avg := float64(sum / samples)
+						// Then we take the sqrt to find the root mean squared
 						rms := math.Sqrt(avg)
+						// I read this on wikipedia for the dB scale being logorithmic
 						db := 20 * math.Log10(rms)
-						//db := 20 * math.Log10(math.Sqrt(float64(sum/samples)))
+						// Print our curent measured level. the \r lets us overwrite the line!!
 						fmt.Printf("\r SPL: %f", db)
 						if writeCSV {
-							csvWriter.WriteString(fmt.Sprintf("%d,%f,%f,%f,%d,%d\n", chkId, db, rms, avg, sum, samples))
+							// if we're writing to a CSV, we'll do that now
+							csvWriter.WriteString(fmt.Sprintf("%d,%f,%f,%f,%f,%.0f\n", chkId, db, rms, avg, sum, samples))
 						}
 					}
+					// reset our counts
 					sum = 0
 					samples = 0
 				}
-				sum += intVal * intVal
+				// for RMS we need the average value, so add em up and we'll divide by the count when we're done
+				sum += val * val
 				samples++
 			}
 
 			if writeWave {
-				_, err := waveWriter.Write([]byte(sample.buffer)) // WriteSample16 for 16 bits
+                                // write our samples into a byte array
+				for i:= 0; i < len(sample.buffer); i++ {
+					// The wav wants ints, so we convert our floats to ints
+					// The floats are -1 to 1, so we multiply by the max value of a 16bit int (because our wav is 16bit)
+					// to get the equivalent int value
+					// This is then written into a byte buffer in little endian form, because this is what the wave writer
+					// prefers. IT can write 1 int at a time, but this is inefficent
+					err := binary.Write(waveBuffer, binary.LittleEndian, int16(sample.buffer[i]*SIGNED_16BIT_INT))
+					if err != nil {
+						log.Fatal(err)
+					}
+				}
+				// write out our wave sample
+				_, err := waveWriter.Write(waveBuffer.Bytes())
 				if err != nil {
 					log.Fatal(err)
 				}
+				// clear the wave buffer
+				waveBuffer.Reset()
 			}
 
 		default:
-			//if we're not active, signal the mothership and return
-			if !active {
-				fmt.Println("-Processor read kill signal")
-				fmt.Printf("Processed %d packets\n", count)
-				if writeWave {
-					waveWriter.Close()
-				}
-				if writeCSV {
-					csvWriter.Flush()
-				}
-				done <- true
-				return
-			}
-			//time.Sleep(time.Millisecond * 25) //else sleep for a bit and try again
 		}
-	}
-
-}
-
-func processInput(inputQueue chan SamplePacket, done chan bool, waveWriter *wave.Writer, csvWriter *bufio.Writer) {
-	var sample SamplePacket
-	values = make(map[int64]*TimeValue)
-	count := 0
-	for {
-		select {
-		case sample = <-inputQueue:
-			if verbose {
-				fmt.Println("--Processor got input")
-			}
-			sampleDur := sample.stop.Sub(sample.start)
-			chunkDur := time.Duration(int64(sampleDur) / int64(len(sample.buffer)))
-			smpsPerChunk := int64(int64(len(sample.buffer)) / int64(sampleDur))
-			smpsPerChunk++ //round up
-
-			currTime := sample.start
-			currChunk := sample.start.Truncate(valueLen).Add(valueLen)
-			chkId := currChunk.UnixNano()
-			for _, val := range sample.buffer {
-				currTime = currTime.Add(chunkDur)
-				if currTime.After(currChunk) {
-					currChunk = currChunk.Add(valueLen)
-					chkId = currChunk.UnixNano()
-				}
-				tv, ok := values[chkId]
-				if !ok {
-					tv = NewTimeValue(currChunk, smpsPerChunk)
-					values[chkId] = tv
-				}
-				tv.values = append(tv.values, int(val))
-			}
-			count++
-
+		//if we're not active, signal the mothership and return
+		if !active {
+			fmt.Println("-Processor read kill signal")
+			fmt.Printf("Processed %d packets\n", count)
 			if writeWave {
-				_, err := waveWriter.Write([]byte(sample.buffer)) // WriteSample16 for 16 bits
-				if err != nil {
-					log.Fatal(err)
-				}
+				waveWriter.Close()
 			}
-
-		default:
-			//if we're not active, signal the mothership and return
-			if !active {
-				fmt.Println("-Processor read kill signal")
-				fmt.Printf("Processed %d packets\n", count)
-				if writeWave {
-					waveWriter.Close()
-				}
-				if writeCSV {
-					writeValues(csvWriter)
-				}
-				done <- true
-				return
+			if writeCSV {
+				csvWriter.Flush()
 			}
-			time.Sleep(time.Millisecond * 500) //else sleep for a bit and try again
+			done <- true
+			return
 		}
-
+		//time.Sleep(time.Millisecond * 25) //else sleep for a bit and try again
 	}
 
 }
 
-func writeValues(csvWriter *bufio.Writer) {
-
-	for key, tv := range values {
-		var sum = 0
-		numValues := len(tv.values)
-		for i := 0; i < numValues; i++ {
-			sum += tv.values[i] * tv.values[i]
-		}
-		avg := 20 * math.Log10(math.Sqrt(float64(sum/len(values)))/127)
-		csvWriter.WriteString(fmt.Sprintf("%d,%f\n", key, avg))
+// writes log message if verbose is enabled
+func vlog(message string) {
+	if verbose {
+		fmt.Println(message)
 	}
-
-	csvWriter.Flush()
 }
 
 func main() {
@@ -204,7 +175,8 @@ func main() {
 	}()
 
 	var audioFileName, csvFileName, preset string
-	var bufferSize, sampleRate, valPerSecond int
+	var bufferSize, sampleRate, valPerSecond, runTime int
+        var bufferLen float32
 	if true {
 		writeWaveTmp := flag.Bool("WriteWave", false, "Write a .wav file of the processed input")
 		waveFileTmp := flag.String("WaveFile", "barkOut.wav", "The file to write to")
@@ -212,9 +184,10 @@ func main() {
 		csvFileTmp := flag.String("CSVFile", "barkOut.csv", "The file to write to")
 		presetTmp := flag.String("Preset", "hifi", "preset recording values (hifi,midfi,lowfi)")
 		bufferSizeTmp := flag.Int("BufferSize", 196608, "Size of framebuffer in bytes")
+		bufferLenTmp := flag.Float64("BufferLength", 1, "How many seconds of audio should our buffer hold")
 		sampleRateTmp := flag.Int("SampleRate", 44100, "Sample Rate")
 		valPerSecondTmp := flag.Int("MeasurementRate", 20, "Numer of measurements per second")
-		realTimeTmp := flag.Bool("RealTime", false, "RealTime mode")
+		runTimeTmp := flag.Int("RunTime", 10, "Run for this many seconds")
 		verboseTmp := flag.Bool("Verbose", false, "Verbose output mode")
 		flag.Parse()
 
@@ -223,12 +196,14 @@ func main() {
 		writeCSV = *writeCSVTmp
 		csvFileName = *csvFileTmp
 		preset = *presetTmp
+		bufferLen = float32(*bufferLenTmp)
 		bufferSize = *bufferSizeTmp
 		sampleRate = *sampleRateTmp
 		valPerSecond = *valPerSecondTmp
 		verbose = *verboseTmp
-		realTime = *realTimeTmp
+                runTime = *runTimeTmp
 		if preset != "" {
+                        fmt.Println("Using Preset");
 			switch preset {
 			case "hifi":
 				sampleRate = 44100
@@ -246,19 +221,45 @@ func main() {
 				log.Fatal("invalid preset " + preset)
 			}
 		}
-		valueLen = time.Duration(int64(time.Second) / int64(valPerSecond))
+		measurementDuration = time.Duration(int64(time.Second) / int64(valPerSecond))
 	}
 
 	//defaults
 	inputChannels := 1
 	outputChannels := 0
-	framesPerBuffer := make([]byte, bufferSize)
+
+        //If we specify a buffer duration, calculate size
+        if bufferLen != 0 {
+		vlog(fmt.Sprintf("  Calculating Buffer Size by duration %f", bufferLen))
+		bufferSize = int(float32(sampleRate) * bufferLen)
+        }
+
+	vlog(fmt.Sprintf("\n\tSample Rate: %d\n\tBuffer Size: %d", sampleRate, bufferSize))
 
 	// init PortAudio
 	portaudio.Initialize()
 	defer portaudio.Terminate()
 
 	processQ := make(chan SamplePacket, 1028)
+        sigChan := make(chan os.Signal, 1)
+
+        // if SIGINT is received, send signal into our signal channel
+        signal.Notify(sigChan, os.Interrupt)
+	go func() {
+		for active {
+			select {
+			// we have received an OS signal... quit. We don't actually care about the signal so _ it
+			case _ = <-sigChan:
+				fmt.Println("Signal received, shutting down!")
+				active = false
+
+			// otherwise sleep for a second, then try again
+			default:
+				time.Sleep(time.Second * 1)
+			}
+		}
+
+	}()
 
 	var waveWriter *wave.Writer
 	var csvWriter *bufio.Writer
@@ -271,7 +272,7 @@ func main() {
 			Out:           waveFile,
 			Channel:       inputChannels,
 			SampleRate:    sampleRate,
-			BitsPerSample: 8, // if 16, change to WriteSample16()
+			BitsPerSample: 16, // if 16, change to WriteSample16()
 		}
 
 		waveWriter, err = wave.NewWriter(param)
@@ -292,15 +293,12 @@ func main() {
 
 	var stErr error
 	var stream *portaudio.Stream
-	if realTime {
-		go processInputRT(processQ, done, waveWriter, csvWriter)
-		handler := &SignalProcessor{time.Now(), processQ}
-		stream, stErr = portaudio.OpenDefaultStream(inputChannels, outputChannels, float64(sampleRate), 1024, handler.handleInput)
-		handler.lastTime = time.Now()
-	} else {
-		go processInput(processQ, done, waveWriter, csvWriter)
-		stream, stErr = portaudio.OpenDefaultStream(inputChannels, outputChannels, float64(sampleRate), len(framesPerBuffer), framesPerBuffer)
-	}
+
+	go processInputRT(processQ, done, waveWriter, csvWriter)
+	handler := &SignalProcessor{time.Now(), processQ}
+	stream, stErr = portaudio.OpenDefaultStream(inputChannels, outputChannels, float64(sampleRate), bufferSize, handler.handleInput)
+	handler.lastTime = time.Now()
+
 	if stErr != nil {
 		log.Fatal(stErr)
 	}
@@ -311,49 +309,18 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if realTime {
-		time.Sleep(time.Second * 10)
-
-	} else {
-
-		hasFailed := 0
-		FAIL_LIMIT := 5
-		for {
-			stopwatch := time.Now()
-			if err := stream.Read(); err != nil {
-				fmt.Println("Error reading stream: " + err.Error() + "\n")
-				if hasFailed >= FAIL_LIMIT {
-					os.Exit(1)
-				} //implicit else
-				hasFailed++
-				time.Sleep(time.Millisecond * 1)
-				continue
-			}
-
-			stopTime := time.Now()
-			if verbose {
-				fmt.Printf("Measured %s of audio\n", stopTime.Sub(stopwatch))
-			}
-
-			processQ <- SamplePacket{[]byte(framesPerBuffer), stopwatch, stopTime}
-
-			//reset fail counter
-			if hasFailed > 0 {
-				hasFailed--
-			}
-
-			if time.Since(start) > time.Second*10 {
-				break
-			}
-
+	for active {
+		time.Sleep(time.Second * 1)
+		if time.Since(start) > time.Second * time.Duration(runTime) {
+			active = false;
+			fmt.Println("Time expired, shutting down!")
 		}
 	}
+
 	doneTime := time.Now()
 	active = false
 
 	fmt.Println("Listener shutdown, waiting for processor")
 	<-done
-	if verbose {
-		fmt.Printf("-- Waited %s for processor\n", time.Since(doneTime))
-	}
+	vlog(fmt.Sprintf("-- Waited %s for processor", time.Since(doneTime)))
 }
