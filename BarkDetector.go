@@ -1,9 +1,9 @@
 package main
 
 import (
-        "bytes"
-	"encoding/binary"
 	"bufio"
+	"bytes"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"github.com/gordonklaus/portaudio"
@@ -14,7 +14,6 @@ import (
 	"os/signal"
 	"time"
 )
-
 
 var active bool = true
 var writeWave, writeCSV bool
@@ -35,6 +34,12 @@ type TimeValue struct {
 	values []int
 }
 
+func NewTimeValue(stamp time.Time, numValues int64) *TimeValue {
+	newTV := TimeValue{stamp: stamp}
+	newTV.values = make([]int, numValues)
+	return &newTV
+}
+
 type SignalProcessor struct {
 	lastTime time.Time
 	processQ chan SamplePacket
@@ -48,13 +53,31 @@ func (sp *SignalProcessor) handleInput(in []float32) {
 	sp.lastTime = currTime
 }
 
-func NewTimeValue(stamp time.Time, numValues int64) *TimeValue {
-	newTV := TimeValue{stamp: stamp}
-	newTV.values = make([]int, numValues)
-	return &newTV
+type BarkProcessor struct {
+	activeBark bool
+	barkStart time.Time
+	latestEvent time.Time
+	barkThreshold float32
+	barkTimeout time.Duration
 }
 
-func processInputRT(inputQueue chan SamplePacket, done chan bool, waveWriter *wave.Writer, csvWriter *bufio.Writer) {
+type BarkEvent struct {
+	start time.Time
+	length time.Duration
+	activeBarking time.Duration
+}
+
+func NewBarkProcessor(barkThreshold float32, barkTimeout time.Duration) *BarkProcessor {
+	bp := BarkProcessor{
+		activeBark: false,
+		barkThreshold: barkThreshold,
+		barkTimeout: barkTimeout
+	}
+
+	return &bp
+}
+
+func (bp *BarkProcessor) processInput(inputQueue chan SamplePacket, done chan bool, waveWriter *wave.Writer, csvWriter *bufio.Writer) {
 	var sample SamplePacket
 	values = make(map[int64]*TimeValue)
 	count := 0
@@ -80,11 +103,11 @@ func processInputRT(inputQueue chan SamplePacket, done chan bool, waveWriter *wa
 			// trucate is used to keep our samples nice and even and avoid weird edge case logic
 			currChunk := currTime.Truncate(measurementDuration).Add(measurementDuration)
 			for _, val := range sample.buffer {
-                                // The values are -1 to 1, so we Multiply by 100 to make a nicer range
+				// The values are -1 to 1, so we Multiply by 100 to make a nicer range
 				// There is no science here. SPL can't really be calculated w/o calibration
 				// Using the max value of a signed 16bit int gets close, but 100 makes the range more sensitive
 				// and this makes bark detection easier
-                                val *= 100
+				val *= 100
 				// advance the current time by the sample's duration
 				currTime = currTime.Add(chunkDur)
 				// if we're past our measurement goal
@@ -107,6 +130,8 @@ func processInputRT(inputQueue chan SamplePacket, done chan bool, waveWriter *wa
 							// if we're writing to a CSV, we'll do that now
 							csvWriter.WriteString(fmt.Sprintf("%d,%f,%f,%f,%f,%.0f\n", chkId, db, rms, avg, sum, samples))
 						}
+						// We have a sound level reading, pass it off for processing of barks
+						bp.handleSample(db)
 					}
 					// reset our counts
 					sum = 0
@@ -118,8 +143,8 @@ func processInputRT(inputQueue chan SamplePacket, done chan bool, waveWriter *wa
 			}
 
 			if writeWave {
-                                // write our samples into a byte array
-				for i:= 0; i < len(sample.buffer); i++ {
+				// write our samples into a byte array
+				for i := 0; i < len(sample.buffer); i++ {
 					// The wav wants ints, so we convert our floats to ints
 					// The floats are -1 to 1, so we multiply by the max value of a 16bit int (because our wav is 16bit)
 					// to get the equivalent int value
@@ -159,6 +184,27 @@ func processInputRT(inputQueue chan SamplePacket, done chan bool, waveWriter *wa
 
 }
 
+func (bp *BarkProcessor) handleSample(soundLevel float32) {
+	isBark := soundLevel >= bp.barkThreshold
+
+	if bp.activeBarking {
+		if isBark {
+
+		} else {
+
+		}
+	}
+	// if active
+		// is bark
+			// set latestEvent
+	// else if active
+		// if past timeout
+			// write bark
+	// else
+		// if bark
+			// activate
+}
+
 // writes log message if verbose is enabled
 func vlog(message string) {
 	if verbose {
@@ -176,34 +222,40 @@ func main() {
 
 	var audioFileName, csvFileName, preset string
 	var bufferSize, sampleRate, valPerSecond, runTime int
-        var bufferLen float32
+	var barkThreshold, bufferLen float32
+	var barkTimeout time.Duration
 	if true {
-		writeWaveTmp := flag.Bool("WriteWave", false, "Write a .wav file of the processed input")
-		waveFileTmp := flag.String("WaveFile", "barkOut.wav", "The file to write to")
-		writeCSVTmp := flag.Bool("WriteCSV", false, "Write a .wav file of the processed input")
+		barkThresholdTmp := flag.Float64("BarkThreshold", 25, "Sound level that indications barking")
+		barkTimeoutTmp := flag.Int("BarkTimeout", 30, "Time in seconds of no barking to indicate stop")
+		bufferLenTmp := flag.Float64("BufferLength", 1, "How many seconds of audio should our buffer hold")
+		bufferSizeTmp := flag.Int("BarkThreshold", 25, "Sound level that indications barking")
+		bufferSizeTmp := flag.Int("BufferSize", 196608, "Size of framebuffer in bytes")
 		csvFileTmp := flag.String("CSVFile", "barkOut.csv", "The file to write to")
 		presetTmp := flag.String("Preset", "hifi", "preset recording values (hifi,midfi,lowfi)")
-		bufferSizeTmp := flag.Int("BufferSize", 196608, "Size of framebuffer in bytes")
-		bufferLenTmp := flag.Float64("BufferLength", 1, "How many seconds of audio should our buffer hold")
+		runTimeTmp := flag.Int("RunTime", 10, "Run for this many seconds")
 		sampleRateTmp := flag.Int("SampleRate", 44100, "Sample Rate")
 		valPerSecondTmp := flag.Int("MeasurementRate", 20, "Numer of measurements per second")
-		runTimeTmp := flag.Int("RunTime", 10, "Run for this many seconds")
 		verboseTmp := flag.Bool("Verbose", false, "Verbose output mode")
+		waveFileTmp := flag.String("WaveFile", "barkOut.wav", "The file to write to")
+		writeCSVTmp := flag.Bool("WriteCSV", false, "Write a .wav file of the processed input")
+		writeWaveTmp := flag.Bool("WriteWave", false, "Write a .wav file of the processed input")
 		flag.Parse()
 
-		writeWave = *writeWaveTmp
 		audioFileName = *waveFileTmp
-		writeCSV = *writeCSVTmp
-		csvFileName = *csvFileTmp
-		preset = *presetTmp
+		barkTimeout = time.Second * *barkTimeoutTmp
 		bufferLen = float32(*bufferLenTmp)
 		bufferSize = *bufferSizeTmp
+		csvFileName = *csvFileTmp
+		preset = *presetTmp
+		runTime = *runTimeTmp
 		sampleRate = *sampleRateTmp
 		valPerSecond = *valPerSecondTmp
 		verbose = *verboseTmp
-                runTime = *runTimeTmp
+		writeCSV = *writeCSVTmp
+		writeWave = *writeWaveTmp
+    barkThreshold = float32(*barkThresholdTmp)
 		if preset != "" {
-                        fmt.Println("Using Preset");
+			fmt.Println("Using Preset")
 			switch preset {
 			case "hifi":
 				sampleRate = 44100
@@ -228,11 +280,11 @@ func main() {
 	inputChannels := 1
 	outputChannels := 0
 
-        //If we specify a buffer duration, calculate size
-        if bufferLen != 0 {
+	//If we specify a buffer duration, calculate size
+	if bufferLen != 0 {
 		vlog(fmt.Sprintf("  Calculating Buffer Size by duration %f", bufferLen))
 		bufferSize = int(float32(sampleRate) * bufferLen)
-        }
+	}
 
 	vlog(fmt.Sprintf("\n\tSample Rate: %d\n\tBuffer Size: %d", sampleRate, bufferSize))
 
@@ -241,10 +293,10 @@ func main() {
 	defer portaudio.Terminate()
 
 	processQ := make(chan SamplePacket, 1028)
-        sigChan := make(chan os.Signal, 1)
+	sigChan := make(chan os.Signal, 1)
 
-        // if SIGINT is received, send signal into our signal channel
-        signal.Notify(sigChan, os.Interrupt)
+	// if SIGINT is received, send signal into our signal channel
+	signal.Notify(sigChan, os.Interrupt)
 	go func() {
 		for active {
 			select {
@@ -294,7 +346,9 @@ func main() {
 	var stErr error
 	var stream *portaudio.Stream
 
-	go processInputRT(processQ, done, waveWriter, csvWriter)
+	barkProcessor := NewBarkProcessor(barkThreshold, barkTimeout)
+
+	go barkProcessor.processInput(processQ, done, waveWriter, csvWriter)
 	handler := &SignalProcessor{time.Now(), processQ}
 	stream, stErr = portaudio.OpenDefaultStream(inputChannels, outputChannels, float64(sampleRate), bufferSize, handler.handleInput)
 	handler.lastTime = time.Now()
@@ -311,8 +365,8 @@ func main() {
 
 	for active {
 		time.Sleep(time.Second * 1)
-		if time.Since(start) > time.Second * time.Duration(runTime) {
-			active = false;
+		if time.Since(start) > time.Second*time.Duration(runTime) {
+			active = false
 			fmt.Println("Time expired, shutting down!")
 		}
 	}
