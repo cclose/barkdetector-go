@@ -29,6 +29,14 @@ type SamplePacket struct {
 	stop   time.Time
 }
 
+func NewSamplePacket(start, stop time.Time, data []float32) *SamplePacket {
+	pkt := SamplePacket{start, stop}
+	// allocation a new slice for the data
+	pkt.buffer = make([]float32, len(data))
+	// copy the data to avoid having it overwritten while processing
+	copy(pkt.buffer, data)
+}
+
 type TimeValue struct {
 	stamp  time.Time
 	values []int
@@ -48,7 +56,8 @@ type SignalProcessor struct {
 func (sp *SignalProcessor) handleInput(in []float32) {
 	currTime := time.Now()
 
-	sp.processQ <- SamplePacket{in, sp.lastTime, currTime}
+	pkt := NewSamplePacket(sp.lastTime, currTime)
+	sp.processQ <- &pkt
 	//vlog(fmt.Sprintf("Measured %s of audio\n", currTime.Sub(sp.lastTime)))
 	sp.lastTime = currTime
 }
