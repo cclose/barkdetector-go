@@ -56,31 +56,36 @@ type SignalProcessor struct {
 func (sp *SignalProcessor) handleInput(in []float32) {
 	currTime := time.Now()
 
-	pkt := NewSamplePacket(sp.lastTime, currTime)
-	sp.processQ <- &pkt
+	// quickly copy our sample so it won't be overwritten by the next call
+        sampleData := make([]float32, len(in))
+	for idx, val := range in {
+		sampleData[idx] = val
+	}
+
+	sp.processQ <- SamplePacket{in, sp.lastTime, currTime}
 	//vlog(fmt.Sprintf("Measured %s of audio\n", currTime.Sub(sp.lastTime)))
 	sp.lastTime = currTime
 }
 
 type BarkProcessor struct {
-	activeBark bool
-	barkStart time.Time
-	latestEvent time.Time
-	barkThreshold float32
-	barkTimeout time.Duration
+	activeBark    bool
+	barkStart     time.Time
+	latestEvent   time.Time
+	barkThreshold float64
+	barkTimeout   time.Duration
 }
 
 type BarkEvent struct {
-	start time.Time
-	length time.Duration
+	start         time.Time
+	length        time.Duration
 	activeBarking time.Duration
 }
 
-func NewBarkProcessor(barkThreshold float32, barkTimeout time.Duration) *BarkProcessor {
+func NewBarkProcessor(barkThreshold float64, barkTimeout time.Duration) *BarkProcessor {
 	bp := BarkProcessor{
-		activeBark: false,
+		activeBark:    false,
 		barkThreshold: barkThreshold,
-		barkTimeout: barkTimeout
+		barkTimeout:   barkTimeout,
 	}
 
 	return &bp
@@ -193,10 +198,10 @@ func (bp *BarkProcessor) processInput(inputQueue chan SamplePacket, done chan bo
 
 }
 
-func (bp *BarkProcessor) handleSample(soundLevel float32) {
+func (bp *BarkProcessor) handleSample(soundLevel float64) {
 	isBark := soundLevel >= bp.barkThreshold
 
-	if bp.activeBarking {
+	if bp.activeBark {
 		if isBark {
 
 		} else {
@@ -204,14 +209,14 @@ func (bp *BarkProcessor) handleSample(soundLevel float32) {
 		}
 	}
 	// if active
-		// is bark
-			// set latestEvent
+	// is bark
+	// set latestEvent
 	// else if active
-		// if past timeout
-			// write bark
+	// if past timeout
+	// write bark
 	// else
-		// if bark
-			// activate
+	// if bark
+	// activate
 }
 
 // writes log message if verbose is enabled
@@ -231,13 +236,13 @@ func main() {
 
 	var audioFileName, csvFileName, preset string
 	var bufferSize, sampleRate, valPerSecond, runTime int
-	var barkThreshold, bufferLen float32
+	var bufferLen float32
+        var barkThreshold float64
 	var barkTimeout time.Duration
 	if true {
 		barkThresholdTmp := flag.Float64("BarkThreshold", 25, "Sound level that indications barking")
 		barkTimeoutTmp := flag.Int("BarkTimeout", 30, "Time in seconds of no barking to indicate stop")
 		bufferLenTmp := flag.Float64("BufferLength", 1, "How many seconds of audio should our buffer hold")
-		bufferSizeTmp := flag.Int("BarkThreshold", 25, "Sound level that indications barking")
 		bufferSizeTmp := flag.Int("BufferSize", 196608, "Size of framebuffer in bytes")
 		csvFileTmp := flag.String("CSVFile", "barkOut.csv", "The file to write to")
 		presetTmp := flag.String("Preset", "hifi", "preset recording values (hifi,midfi,lowfi)")
@@ -251,7 +256,8 @@ func main() {
 		flag.Parse()
 
 		audioFileName = *waveFileTmp
-		barkTimeout = time.Second * *barkTimeoutTmp
+		barkThreshold = *barkThresholdTmp
+		barkTimeout = time.Second * time.Duration(*barkTimeoutTmp)
 		bufferLen = float32(*bufferLenTmp)
 		bufferSize = *bufferSizeTmp
 		csvFileName = *csvFileTmp
@@ -262,7 +268,6 @@ func main() {
 		verbose = *verboseTmp
 		writeCSV = *writeCSVTmp
 		writeWave = *writeWaveTmp
-    barkThreshold = float32(*barkThresholdTmp)
 		if preset != "" {
 			fmt.Println("Using Preset")
 			switch preset {
